@@ -1,415 +1,329 @@
 /**
- * GemLog Next — Main Controller
- * 全モジュールの統合・イベントリスナー登録・初期化を担当する。
+ * GemLog Next — Popup Main Controller (Session-based)
+ *
+ * セキュリティ設計:
+ *   - 永続ストレージを使用しない
+ *   - 現在開いているGeminiタブのセッションのみ表示
+ *   - ダウンロードはユーザーが明示的に選択したものだけ
  */
 import { applyTranslations, showToast, downloadFile, formatDate, escapeHtml, sanitizeFilename, isValidHttpsUrl } from './utils.js';
-import { summarizeCurrentChat, copySummary } from './api-manager.js';
-import { switchTab, updateStorageUsage, toggleApiFields, openChatDetail, renderManagedList, validateEndpointUrl } from './ui-manager.js';
 
-let currentChatId = null;
-const setCurrentChatId = id => { currentChatId = id; };
+// ===== 状態管理 =====
+let selectedTabIds = new Set();
+let allSessions    = [];
+let refreshTimer   = null;
 
-// ===== チャット一覧描画 =====
+// ===== セッション一覧の取得と描画 =====
 
-async function renderChatList(searchQuery = '') {
-  const container = document.getElementById('chatList');
-  const settings  = await GemLogStorage.getSettings();
-  const favorites = settings.favorites || [];
+async function loadSessions() {
+  // 開いている全Geminiタブを取得
+  const geminiTabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
+  const tabMap     = Object.fromEntries(geminiTabs.map(t => [t.id, t]));
 
-  // 検索またはインデックス全件取得
-  let chats;
-  if (searchQuery.trim()) {
-    chats = await GemLogStorage.searchChats(searchQuery) || [];
-  } else {
-    const index = await GemLogStorage.getChatIndex();
-    chats = Object.values(index);
-  }
+  // セッションデータを取得
+  const sessions = await GemLogSession.getAll();
 
-  // ソート・フィルタ
-  const sortBy   = document.getElementById('sortSelect').value;
-  const filterBy = document.getElementById('filterSelect').value;
-  chats = applySortFilter(chats, sortBy, filterBy, favorites);
+  // 存在するタブのセッションのみ表示（孤立セッションは除外）
+  allSessions = sessions
+    .filter(s => tabMap[s.tabId])
+    .map(s => ({ ...s, tab: tabMap[s.tabId] }))
+    .sort((a, b) => new Date(b.updatedAt || b.startedAt) - new Date(a.updatedAt || a.startedAt));
 
-  // カウントバッジ更新
-  document.getElementById('chatCountBadge').textContent = chats.length;
+  // 選択済みセットを有効なタブIDに絞る
+  const validIds = new Set(allSessions.map(s => s.tabId));
+  selectedTabIds = new Set([...selectedTabIds].filter(id => validIds.has(id)));
 
-  if (chats.length === 0) {
-    const isSearch = searchQuery.trim();
+  renderSessionList();
+  updateDownloadButton();
+  await updateStorageUsage();
+}
+
+function renderSessionList() {
+  const container = document.getElementById('sessionList');
+
+  if (allSessions.length === 0) {
     container.innerHTML = `
       <div class="empty-state">
-        <div class="empty-icon">${isSearch ? '🔍' : '💬'}</div>
-        <div class="empty-title">${chrome.i18n.getMessage(isSearch ? 'noSearchResults' : 'noChatsMessage')}</div>
-        <div class="empty-sub">${isSearch ? '' : chrome.i18n.getMessage('noChatsSubMessage')}</div>
+        <div class="empty-icon">💬</div>
+        <div class="empty-title" data-i18n="noSessionsTitle">Geminiのタブが開いていません</div>
+        <div class="empty-sub" data-i18n="noSessionsSub">Geminiでチャットを始めると、セッションが表示されます</div>
+        <div class="empty-hint" data-i18n="noSessionsHint">→ gemini.google.com を開いてください</div>
       </div>`;
+    applyTranslations();
     return;
   }
 
-  container.innerHTML = chats.map((chat, i) => {
-    const isFav    = favorites.includes(chat.id);
-    const tagsHtml = (chat.tags || []).map(t =>
-      `<span class="tag" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</span>`
-    ).join('');
+  container.innerHTML = allSessions.map((s, i) => {
+    const isSelected = selectedTabIds.has(s.tabId);
+    const count      = s.messageCount || s.messages?.length || 0;
+    const time       = s.updatedAt ? formatDate(s.updatedAt) : formatDate(s.startedAt);
+    const title      = s.title || chrome.i18n.getMessage('untitledChat');
 
     return `
-      <div class="chat-item${isFav ? ' favorited' : ''}" data-chatid="${escapeHtml(chat.id)}" style="animation-delay:${i * 35}ms">
-        <div class="chat-item-header">
-          <button class="favorite-btn${isFav ? ' active' : ''}" data-chatid="${escapeHtml(chat.id)}" title="Favorite">
-            ${isFav ? '★' : '☆'}
-          </button>
-          <div class="chat-title">${escapeHtml(chat.title || chrome.i18n.getMessage('untitledChat'))}</div>
+      <div class="session-item${isSelected ? ' selected' : ''}" data-tabid="${s.tabId}" style="animation-delay:${i * 40}ms">
+        <input type="checkbox" class="session-checkbox" data-tabid="${s.tabId}" ${isSelected ? 'checked' : ''}>
+        <div class="session-info">
+          <div class="session-title">${escapeHtml(title)}</div>
+          <div class="session-meta">
+            <span class="msg-badge">${count} ${chrome.i18n.getMessage('itemCount')}</span>
+            <span class="dot">·</span>
+            <span>${time}</span>
+            <span class="dot">·</span>
+            <span>Tab ${s.tabId}</span>
+          </div>
         </div>
-        <div class="chat-meta">
-          <span>${chat.messageCount || 0} ${chrome.i18n.getMessage('itemCount')}</span>
-          <span>·</span>
-          <span>${formatDate(chat.updated || chat.created)}</span>
-        </div>
-        ${tagsHtml ? `<div class="chat-tags">${tagsHtml}</div>` : ''}
-        <div class="chat-actions">
-          <button class="btn xs copy-md-btn"   data-chatid="${escapeHtml(chat.id)}">📋 MD</button>
-          <button class="btn xs copy-json-btn" data-chatid="${escapeHtml(chat.id)}">📋 JSON</button>
-          <button class="btn xs export-btn"    data-chatid="${escapeHtml(chat.id)}">⬇</button>
+        <div class="session-actions">
+          <button class="btn xs single-dl-btn" data-tabid="${s.tabId}" title="Download this session">⬇</button>
         </div>
       </div>`;
   }).join('');
 
-  // イベント: カードクリック → 詳細
-  container.querySelectorAll('.chat-item').forEach(item => {
-    item.addEventListener('click', e => {
-      if (e.target.closest('.chat-actions, .favorite-btn, .tag')) return;
-      openChatDetail(item.dataset.chatid, setCurrentChatId);
+  // イベント: チェックボックス
+  container.querySelectorAll('.session-checkbox').forEach(chk => {
+    chk.addEventListener('change', () => {
+      const id = parseInt(chk.dataset.tabid);
+      if (chk.checked) selectedTabIds.add(id);
+      else              selectedTabIds.delete(id);
+
+      // カードの selected クラスを更新
+      chk.closest('.session-item').classList.toggle('selected', chk.checked);
+      updateDownloadButton();
+      updateSelectAllCheckbox();
     });
   });
 
-  // イベント: お気に入りトグル
-  container.querySelectorAll('.favorite-btn').forEach(btn => {
+  // イベント: カードクリック（チェックボックス以外の領域）
+  container.querySelectorAll('.session-item').forEach(item => {
+    item.addEventListener('click', e => {
+      if (e.target.classList.contains('session-checkbox') ||
+          e.target.closest('.session-actions')) return;
+      const chk = item.querySelector('.session-checkbox');
+      chk.checked = !chk.checked;
+      chk.dispatchEvent(new Event('change'));
+    });
+  });
+
+  // イベント: 単体ダウンロードボタン
+  container.querySelectorAll('.single-dl-btn').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation();
-      const added = await GemLogStorage.toggleFavorite(btn.dataset.chatid);
-      showToast(chrome.i18n.getMessage(added ? 'toastFavoriteAdded' : 'toastFavoriteRemoved'));
-      renderChatList(document.getElementById('searchInput').value);
+      const tabId = parseInt(btn.dataset.tabid);
+      const s     = allSessions.find(x => x.tabId === tabId);
+      if (s) await downloadSessions([s]);
     });
   });
 
-  // イベント: タグクリック → タグ検索
-  container.querySelectorAll('.tag').forEach(tag => {
-    tag.addEventListener('click', e => {
-      e.stopPropagation();
-      const input = document.getElementById('searchInput');
-      input.value = tag.dataset.tag;
-      document.getElementById('searchBar').classList.add('visible');
-      renderChatList(tag.dataset.tag);
-    });
-  });
-
-  // イベント: コピー・エクスポート
-  container.querySelectorAll('.copy-md-btn').forEach(btn => {
-    btn.addEventListener('click', e => { e.stopPropagation(); copyChat(btn.dataset.chatid, 'markdown'); });
-  });
-  container.querySelectorAll('.copy-json-btn').forEach(btn => {
-    btn.addEventListener('click', e => { e.stopPropagation(); copyChat(btn.dataset.chatid, 'json'); });
-  });
-  container.querySelectorAll('.export-btn').forEach(btn => {
-    btn.addEventListener('click', e => { e.stopPropagation(); exportChat(btn.dataset.chatid); });
-  });
+  updateSelectAllCheckbox();
 }
 
-function applySortFilter(chats, sortBy, filterBy, favorites) {
-  let list = filterBy === 'favorites'
-    ? chats.filter(c => favorites.includes(c.id))
-    : chats;
-
-  switch (sortBy) {
-    case 'oldest':
-      return list.sort((a, b) => new Date(a.created) - new Date(b.created));
-    case 'messages':
-      return list.sort((a, b) => (b.messageCount || 0) - (a.messageCount || 0));
-    case 'favorites':
-      return list.sort((a, b) => {
-        const af = favorites.includes(a.id) ? 1 : 0;
-        const bf = favorites.includes(b.id) ? 1 : 0;
-        return (bf - af) || new Date(b.updated || b.created) - new Date(a.updated || a.created);
-      });
-    default:
-      return list.sort((a, b) => new Date(b.updated || b.created) - new Date(a.updated || a.created));
-  }
+function updateDownloadButton() {
+  const btn   = document.getElementById('downloadBtn');
+  const count = selectedTabIds.size;
+  btn.disabled  = count === 0;
+  btn.textContent = `⬇ ${chrome.i18n.getMessage('btnDownloadLabel')} (${count})`;
 }
 
-// ===== コピー・エクスポート =====
-
-async function copyChat(chatId, format) {
-  const chatData = await GemLogStorage.getChat(chatId);
-  if (!chatData) return showToast(chrome.i18n.getMessage('errDataNotFound'));
-  const content = format === 'markdown'
-    ? GemLogStorage.chatToMarkdown(chatData)
-    : GemLogStorage.chatToJSON(chatData);
-  try {
-    await navigator.clipboard.writeText(content);
-    showToast(`${format === 'markdown' ? 'Markdown' : 'JSON'} ${chrome.i18n.getMessage('toastCopied')}`);
-  } catch {
-    showToast(chrome.i18n.getMessage('toastCopyFailed'));
-  }
-}
-
-async function exportChat(chatId) {
-  const chatData = await GemLogStorage.getChat(chatId);
-  if (!chatData) return showToast(chrome.i18n.getMessage('errDataNotFound'));
-
-  const settings  = await GemLogStorage.getSettings();
-  const format    = settings.exportFormat || 'markdown';
-  const safeName  = sanitizeFilename(chatData.title);
-  const timestamp = new Date().toISOString().split('T')[0];
-
-  if (format === 'obsidian') {
-    downloadFile(`${safeName}_${timestamp}.md`, GemLogStorage.chatToObsidian(chatData), 'text/markdown');
-  } else if (format === 'json') {
-    downloadFile(`${safeName}_${timestamp}.json`, GemLogStorage.chatToJSON(chatData), 'application/json');
+function updateSelectAllCheckbox() {
+  const chk = document.getElementById('selectAllChk');
+  if (allSessions.length === 0) {
+    chk.checked       = false;
+    chk.indeterminate = false;
+  } else if (selectedTabIds.size === allSessions.length) {
+    chk.checked       = true;
+    chk.indeterminate = false;
+  } else if (selectedTabIds.size > 0) {
+    chk.checked       = false;
+    chk.indeterminate = true;
   } else {
-    downloadFile(`${safeName}_${timestamp}.md`, GemLogStorage.chatToMarkdown(chatData), 'text/markdown');
+    chk.checked       = false;
+    chk.indeterminate = false;
   }
-  showToast(`${format} ${chrome.i18n.getMessage('toastExported')}`);
+}
+
+// ===== ダウンロード =====
+
+async function downloadSessions(sessions) {
+  if (!sessions.length) return;
+
+  const format = document.getElementById('downloadFormat').value;
+
+  for (let i = 0; i < sessions.length; i++) {
+    const s        = sessions[i];
+    const safeName = sanitizeFilename(s.title || 'chat');
+    const date     = (s.startedAt || new Date().toISOString()).split('T')[0];
+    const filename = `${safeName}_${date}`;
+
+    let content, mime;
+    if (format === 'json') {
+      content = GemLogSession.chatToJSON(s);
+      mime    = 'application/json';
+      downloadFile(`${filename}.json`, content, mime);
+    } else if (format === 'obsidian') {
+      content = GemLogSession.chatToObsidian(s);
+      mime    = 'text/markdown';
+      downloadFile(`${filename}.md`, content, mime);
+    } else {
+      content = GemLogSession.chatToMarkdown(s);
+      mime    = 'text/markdown';
+      downloadFile(`${filename}.md`, content, mime);
+    }
+
+    // 複数ファイルを連続ダウンロードする場合に少し間隔を空ける
+    if (i < sessions.length - 1) {
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+
+  showToast(`${sessions.length} ${chrome.i18n.getMessage('toastDownloaded')}`);
+}
+
+// ===== ストレージ使用量 =====
+
+async function updateStorageUsage() {
+  try {
+    // chrome.storage.session の使用量（getBytesInUse はセッションも対応）
+    const bytes   = await new Promise(r => chrome.storage.session.getBytesInUse(null, r));
+    const kb      = (bytes / 1024).toFixed(1);
+    const percent = Math.min((bytes / (10 * 1024 * 1024)) * 100, 100); // 上限10MB
+    document.getElementById('storageUsage').textContent = `${kb} KB / 10 MB`;
+    document.getElementById('storageBar').style.width   = `${percent.toFixed(1)}%`;
+  } catch {
+    // getBytesInUse が session に未対応の Chrome バージョン対策
+    document.getElementById('storageUsage').textContent = '—';
+  }
 }
 
 // ===== 設定 =====
 
 async function loadSettings() {
-  const settings = await GemLogStorage.getSettings();
-  document.getElementById('loggingMode').value  = settings.loggingMode;
-  document.getElementById('apiProvider').value  = settings.apiProvider;
-  document.getElementById('apiKey').value       = settings.apiKey || '';
-  document.getElementById('apiModel').value     = settings.apiModel || '';
-  document.getElementById('apiEndpoint').value  = settings.apiEndpoint || '';
-  document.getElementById('exportFormat').value = settings.exportFormat || 'markdown';
-  toggleApiFields(settings.apiProvider);
+  const s = await GemLogSettings.get();
+  document.getElementById('apiProvider').value  = s.apiProvider;
+  document.getElementById('apiKey').value       = s.apiKey || '';
+  document.getElementById('apiModel').value     = s.apiModel || '';
+  document.getElementById('apiEndpoint').value  = s.apiEndpoint || '';
+  document.getElementById('exportFormat').value = s.exportFormat || 'markdown';
+  toggleApiFields(s.apiProvider);
   validateEndpointUrl();
-  renderManagedList(updateCurrentChatAction);
 }
 
 async function saveSettings() {
-  const endpoint = document.getElementById('apiEndpoint').value.trim();
   const provider = document.getElementById('apiProvider').value;
+  const endpoint = document.getElementById('apiEndpoint').value.trim();
 
-  // カスタムエンドポイントのURLを検証
   if (provider === 'custom' && endpoint && !isValidHttpsUrl(endpoint)) {
     showToast(chrome.i18n.getMessage('errEndpointNotHttps'));
     return;
   }
 
-  const settings = {
-    loggingMode:  document.getElementById('loggingMode').value,
+  await GemLogSettings.save({
     apiProvider:  provider,
     apiKey:       document.getElementById('apiKey').value,
     apiModel:     document.getElementById('apiModel').value,
     apiEndpoint:  endpoint,
     exportFormat: document.getElementById('exportFormat').value
-  };
-  await GemLogStorage.saveSettings(settings);
+  });
+
   showToast(chrome.i18n.getMessage('toastSettingsSaved'));
-  renderManagedList(updateCurrentChatAction);
 }
 
-// ===== コンテンツスクリプト連携 =====
-
-async function checkContentScriptStatus() {
-  const dot = document.getElementById('statusDot');
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.url?.includes('gemini.google.com')) {
-      dot.classList.remove('active');
-      return;
-    }
-    chrome.tabs.sendMessage(tab.id, { action: 'getStatus' }, response => {
-      if (chrome.runtime.lastError || !response) {
-        dot.classList.remove('active');
-      } else {
-        dot.classList.add('active');
-        dot.title = `Active · ${response.processedTurns} turns`;
-      }
-    });
-  } catch {
-    dot.classList.remove('active');
-  }
+function toggleApiFields(provider) {
+  document.getElementById('apiFields').style.display     = provider === 'none' ? 'none' : 'flex';
+  document.getElementById('endpointGroup').style.display = provider === 'custom' ? 'block' : 'none';
 }
 
-async function updateCurrentChatAction() {
-  const bar = document.getElementById('currentChatBar');
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.url?.includes('gemini.google.com')) {
-    bar.classList.remove('visible');
-    return;
+function validateEndpointUrl() {
+  const input  = document.getElementById('apiEndpoint');
+  const status = document.getElementById('urlStatus');
+  const error  = document.getElementById('endpointError');
+  const value  = input.value.trim();
+
+  if (!value) {
+    status.textContent = ''; status.className = 'url-status';
+    error.classList.remove('visible'); input.classList.remove('error');
+    return true;
   }
+  if (isValidHttpsUrl(value)) {
+    status.textContent = '✓ Valid HTTPS URL'; status.className = 'url-status valid';
+    error.classList.remove('visible'); input.classList.remove('error');
+    return true;
+  }
+  status.textContent = '✗ Invalid'; status.className = 'url-status invalid';
+  error.classList.add('visible'); input.classList.add('error');
+  return false;
+}
 
-  chrome.tabs.sendMessage(tab.id, { action: 'getStatus' }, async response => {
-    if (chrome.runtime.lastError || !response?.chatId) return;
-    const chatId   = response.chatId;
-    const settings = await GemLogStorage.getSettings();
-    const badge    = document.getElementById('loggingBadge');
-    const btn      = document.getElementById('toggleLoggingBtn');
-    const scrollBtn = document.getElementById('autoScrollBtn');
+// ===== タブ切替 =====
 
-    bar.classList.add('visible');
-
-    const isIncluded = (settings.whitelist || []).includes(chatId);
-    const isExcluded = (settings.blacklist || []).includes(chatId);
-    let isLogging = false;
-
-    if (settings.loggingMode === 'whitelist') {
-      isLogging = isIncluded;
-      btn.style.display  = 'block';
-      btn.textContent    = isIncluded ? chrome.i18n.getMessage('btnStopLogging') : chrome.i18n.getMessage('btnStartLogging');
-      btn.className      = isIncluded ? 'btn sm danger' : 'btn sm primary';
-      badge.textContent  = isIncluded ? chrome.i18n.getMessage('badgeRecording') : chrome.i18n.getMessage('badgeUnrecorded');
-      badge.className    = `logging-badge ${isIncluded ? 'recording' : 'stopped'}`;
-    } else if (settings.loggingMode === 'blacklist') {
-      isLogging = !isExcluded;
-      btn.style.display  = 'block';
-      btn.textContent    = isExcluded ? chrome.i18n.getMessage('btnResumeLogging') : chrome.i18n.getMessage('btnExcludeChat');
-      btn.className      = isExcluded ? 'btn sm primary' : 'btn sm danger';
-      badge.textContent  = isExcluded ? chrome.i18n.getMessage('badgeExcluded') : chrome.i18n.getMessage('badgeRecording');
-      badge.className    = `logging-badge ${isExcluded ? 'stopped' : 'recording'}`;
-    } else {
-      isLogging = true;
-      btn.style.display  = 'none';
-      badge.textContent  = chrome.i18n.getMessage('badgeRecording');
-      badge.className    = 'logging-badge recording';
-    }
-
-    btn.onclick = async () => {
-      const listType = settings.loggingMode === 'whitelist' ? 'whitelist' : 'blacklist';
-      await GemLogStorage.toggleChatInList(listType, chatId);
-      showToast(chrome.i18n.getMessage('toastSettingsUpdated'));
-      if (settings.loggingMode === 'whitelist' && !isIncluded) {
-        chrome.tabs.sendMessage(tab.id, { action: 'forceScan' });
-      }
-      updateCurrentChatAction();
-      renderChatList(document.getElementById('searchInput').value);
-    };
-
-    scrollBtn.style.display = isLogging ? 'block' : 'none';
-    scrollBtn.onclick = () => {
-      chrome.tabs.sendMessage(tab.id, { action: 'autoScroll' });
-      window.close();
-    };
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => {
+    const active = p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1);
+    p.classList.toggle('active', active);
+    p.style.display = active ? '' : 'none';
   });
 }
 
-// ===== 検索（デバウンス付き） =====
+// ===== 自動リフレッシュ =====
 
-let searchTimer = null;
-function onSearchInput(query) {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => renderChatList(query), 200);
+function startAutoRefresh() {
+  stopAutoRefresh();
+  refreshTimer = setInterval(loadSessions, 5000);
 }
 
-// ===== イベントリスナー登録 =====
+function stopAutoRefresh() {
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+}
 
-// 検索トグル
-document.getElementById('searchToggleBtn').addEventListener('click', () => {
-  const bar = document.getElementById('searchBar');
-  const btn = document.getElementById('searchToggleBtn');
-  const visible = bar.classList.toggle('visible');
-  btn.classList.toggle('active', visible);
-  if (visible) {
-    document.getElementById('searchInput').focus();
-  } else {
-    document.getElementById('searchInput').value = '';
-    renderChatList();
-  }
-});
+// ===== イベントリスナー =====
 
-document.getElementById('searchInput').addEventListener('input', e => onSearchInput(e.target.value));
-
-// ソート・フィルタ変更
-document.getElementById('sortSelect').addEventListener('change',   () => renderChatList(document.getElementById('searchInput').value));
-document.getElementById('filterSelect').addEventListener('change', () => renderChatList(document.getElementById('searchInput').value));
-
-// タブ
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => switchTab(tab.dataset.tab));
 });
 
-// リフレッシュ
-document.getElementById('refreshBtn').addEventListener('click', async () => {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url?.includes('gemini.google.com')) {
-      chrome.tabs.sendMessage(tab.id, { action: 'forceScan' });
-      showToast(chrome.i18n.getMessage('toastRescanned'));
-    }
-  } catch { /* Gemini以外のタブ */ }
-  await renderChatList(document.getElementById('searchInput').value);
-  await updateStorageUsage();
-  await checkContentScriptStatus();
-  updateCurrentChatAction();
+document.getElementById('refreshBtn').addEventListener('click', () => {
+  loadSessions();
+  showToast(chrome.i18n.getMessage('toastRescanned'));
 });
 
-// 詳細パネル
-document.getElementById('backBtn').addEventListener('click', () => {
-  switchTab('chats');
-  renderChatList(document.getElementById('searchInput').value);
+// セッションパネルの「すべて選択」
+document.getElementById('selectAllChk').addEventListener('change', e => {
+  if (e.target.checked) {
+    selectedTabIds = new Set(allSessions.map(s => s.tabId));
+  } else {
+    selectedTabIds.clear();
+  }
+  renderSessionList();
+  updateDownloadButton();
 });
 
-document.getElementById('detailFavoriteBtn').addEventListener('click', async () => {
-  if (!currentChatId) return;
-  const added = await GemLogStorage.toggleFavorite(currentChatId);
-  const btn   = document.getElementById('detailFavoriteBtn');
-  btn.textContent = added ? '★' : '☆';
-  btn.classList.toggle('active', added);
-  showToast(chrome.i18n.getMessage(added ? 'toastFavoriteAdded' : 'toastFavoriteRemoved'));
-});
-
-document.getElementById('copyMdBtnDetail').addEventListener('click',   () => { if (currentChatId) copyChat(currentChatId, 'markdown'); });
-document.getElementById('copyJsonBtnDetail').addEventListener('click', () => { if (currentChatId) copyChat(currentChatId, 'json'); });
-document.getElementById('summarizeBtn').addEventListener('click',      () => summarizeCurrentChat(currentChatId, () => switchTab('settings')));
-document.getElementById('copySummaryBtn').addEventListener('click',    copySummary);
-
-document.getElementById('deleteChatBtn').addEventListener('click', async () => {
-  if (!currentChatId) return;
-  if (!confirm(chrome.i18n.getMessage('confirmDeleteChat'))) return;
-  await GemLogStorage.deleteChat(currentChatId);
-  showToast(chrome.i18n.getMessage('toastChatDeleted'));
-  switchTab('chats');
-  renderChatList();
-  updateStorageUsage();
+// ダウンロードボタン
+document.getElementById('downloadBtn').addEventListener('click', async () => {
+  const targets = allSessions.filter(s => selectedTabIds.has(s.tabId));
+  await downloadSessions(targets);
 });
 
 // 設定
-document.getElementById('loggingMode').addEventListener('change', () => renderManagedList(updateCurrentChatAction));
 document.getElementById('apiProvider').addEventListener('change', e => toggleApiFields(e.target.value));
 document.getElementById('apiEndpoint').addEventListener('input',  validateEndpointUrl);
 document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
 
-// APIキー表示トグル
 document.getElementById('apiKeyToggle').addEventListener('click', () => {
   const input = document.getElementById('apiKey');
   const btn   = document.getElementById('apiKeyToggle');
-  if (input.type === 'password') {
-    input.type   = 'text';
-    btn.textContent = '🙈';
-  } else {
-    input.type   = 'password';
-    btn.textContent = '👁';
-  }
-});
-
-// 全削除
-document.getElementById('deleteAllBtn').addEventListener('click', async () => {
-  if (!confirm(chrome.i18n.getMessage('confirmDeleteAll'))) return;
-  if (!confirm(chrome.i18n.getMessage('confirmDeleteAllReally'))) return;
-  await GemLogStorage.deleteAllChats();
-  showToast(chrome.i18n.getMessage('toastAllDeleted'));
-  renderChatList();
-  updateStorageUsage();
+  input.type       = input.type === 'password' ? 'text' : 'password';
+  btn.textContent  = input.type === 'password' ? '👁' : '🙈';
 });
 
 // ===== 初期化 =====
 
 async function init() {
   applyTranslations();
-  await renderChatList();
-  await updateStorageUsage();
   await loadSettings();
-  await checkContentScriptStatus();
-  updateCurrentChatAction();
+  await loadSessions();
+  startAutoRefresh();
+
+  // popupが閉じたら自動リフレッシュを停止
+  window.addEventListener('unload', stopAutoRefresh);
 }
 
 init();

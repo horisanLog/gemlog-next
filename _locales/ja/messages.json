@@ -94,5 +94,15 @@
   "toastAutoScrollProgress":   { "message": "🔄 自動取得中... (高さ: " },
   "toastAutoScrollReachedTop": { "message": "✅ 先頭に到達！時系列順に再構築しています..." },
   "toastAutoScrollDone":       { "message": "✨ 完了しました！GemLog Nextポップアップから確認できます。" },
-  "btnRefreshTitle":           { "message": "再読み込み" }
+  "btnRefreshTitle":           { "message": "再読み込み" },
+
+  "tabSessions":          { "message": "セッション" },
+  "sessionNotice":        { "message": "履歴はセッション限定です。別ページに移動またはタブを閉じると自動削除されます。" },
+  "selectAll":            { "message": "すべて選択" },
+  "btnDownload":          { "message": "⬇ ダウンロード (0)" },
+  "btnDownloadLabel":     { "message": "ダウンロード" },
+  "toastDownloaded":      { "message": "件のチャットをダウンロードしました" },
+  "noSessionsTitle":      { "message": "Geminiのタブが開いていません" },
+  "noSessionsSub":        { "message": "Geminiでチャットを始めると、セッションが表示されます" },
+  "noSessionsHint":       { "message": "→ gemini.google.com を開いてください" }
 }

@@ -94,5 +94,15 @@
   "toastAutoScrollProgress":   { "message": "🔄 Fetching... (Height: " },
   "toastAutoScrollReachedTop": { "message": "✅ Reached the top! Rebuilding in order..." },
   "toastAutoScrollDone":       { "message": "✨ Done! Check the GemLog Next popup." },
-  "btnRefreshTitle":           { "message": "Refresh" }
+  "btnRefreshTitle":           { "message": "Refresh" },
+
+  "tabSessions":          { "message": "Sessions" },
+  "sessionNotice":        { "message": "History is session-only. Navigating away or closing the tab automatically deletes it." },
+  "selectAll":            { "message": "Select All" },
+  "btnDownload":          { "message": "⬇ Download (0)" },
+  "btnDownloadLabel":     { "message": "Download" },
+  "toastDownloaded":      { "message": "session(s) downloaded" },
+  "noSessionsTitle":      { "message": "No Gemini tabs open" },
+  "noSessionsSub":        { "message": "Open a Gemini chat to see it appear here" },
+  "noSessionsHint":       { "message": "→ Open gemini.google.com" }
 }

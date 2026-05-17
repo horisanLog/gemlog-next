@@ -1,6 +1,10 @@
 /**
  * GemLog Next — Content Script
- * gemini.google.com のチャット画面をMutationObserverで監視し、メッセージを記録する。
+ *
+ * セキュリティ設計:
+ *   - チャット履歴は chrome.storage.session に保存（ブラウザ終了で自動消去）
+ *   - background とのポート接続を利用し、ページ離脱時にセッションを自動削除
+ *   - Gemini 内でチャットを切り替えた場合も前のセッションを削除
  */
 (function () {
   'use strict';
@@ -8,12 +12,29 @@
   if (window.__gemlog_next_initialized) return;
   window.__gemlog_next_initialized = true;
 
+  let tabId         = null;   // background から取得
   let currentChatId = null;
-  let observer = null;
-  let busyObserver = null;
+  let port          = null;   // background との永続接続（切断=セッション削除のトリガー）
+  let observer      = null;
+  let busyObserver  = null;
   const processedTurns = new Set();
 
-  // --- Utilities ---
+  // ===== Tab ID の取得と初期化 =====
+
+  async function init() {
+    // background に tab ID を要求
+    const response = await chrome.runtime.sendMessage({ action: 'getTabId' });
+    tabId = response?.tabId;
+    if (!tabId) return;
+
+    // ポート接続 — 切断時に background がセッションを削除する
+    port = chrome.runtime.connect({ name: `gemlog-session-${tabId}` });
+
+    currentChatId = getChatIdFromURL();
+    startExtension();
+  }
+
+  // ===== URL・Chat ID =====
 
   function getChatIdFromURL() {
     const match = location.pathname.match(/\/app\/([a-f0-9]+)/);
@@ -21,99 +42,86 @@
   }
 
   function getChatTitle() {
-    const precise = document.querySelector('[data-test-id="conversation-title"]');
-    if (precise) {
-      const text = precise.textContent.trim();
-      if (text && !['Gemini', 'Google Gemini'].includes(text)) return text;
+    const el = document.querySelector('[data-test-id="conversation-title"]');
+    if (el) {
+      const t = el.textContent.trim();
+      if (t && !['Gemini', 'Google Gemini'].includes(t)) return t;
     }
-    const pageTitle = document.title
+    const pt = document.title
       .replace(/\s*[-–]\s*Gemini$/i, '')
       .replace(/\s*[-–]\s*Google$/i, '')
       .replace(/^Gemini\s*[-–]?\s*/, '')
       .trim();
-    if (pageTitle && !['Gemini', 'Google Gemini'].includes(pageTitle)) return pageTitle;
+    if (pt && !['Gemini', 'Google Gemini'].includes(pt)) return pt;
     return `Chat ${new Date().toLocaleDateString('ja-JP')}`;
   }
 
-  // --- DOM Extractors ---
+  // ===== DOM 抽出 =====
 
   function extractUserQuery(container) {
     const lines = container.querySelectorAll('.query-text-line');
-    if (lines.length > 0) {
-      return Array.from(lines).map(l => l.textContent.trim()).filter(Boolean).join('\n');
-    }
+    if (lines.length) return Array.from(lines).map(l => l.textContent.trim()).filter(Boolean).join('\n');
     return container.querySelector('.query-text')?.textContent.trim() || '';
   }
 
   function extractUserImages(container) {
-    const imgs = container.querySelectorAll('user-query-file-preview img[data-test-id="uploaded-img"]');
-    return Array.from(imgs).map(img => img.src).filter(Boolean);
+    return Array.from(
+      container.querySelectorAll('user-query-file-preview img[data-test-id="uploaded-img"]')
+    ).map(img => img.src).filter(Boolean);
   }
 
   function extractModelResponse(container) {
-    const markdownEl = container.querySelector('message-content .markdown');
-    if (!markdownEl) return '';
-    const clone = markdownEl.cloneNode(true);
+    const el = container.querySelector('message-content .markdown');
+    if (!el) return '';
+    const clone = el.cloneNode(true);
     clone.querySelectorAll('code-block').forEach((cb, i) => {
-      const span = document.createElement('span');
-      span.textContent = `[CODE_BLOCK_${i}]`;
-      cb.replaceWith(span);
+      const s = document.createElement('span');
+      s.textContent = `[CODE_BLOCK_${i}]`;
+      cb.replaceWith(s);
     });
-    clone.querySelectorAll('mini-app, response-element').forEach(el => {
-      el.textContent = '[Interactive Widget]';
-    });
+    clone.querySelectorAll('mini-app, response-element').forEach(e => { e.textContent = '[Interactive Widget]'; });
     return clone.textContent.trim();
   }
 
   function extractCodeBlocks(container) {
     return Array.from(container.querySelectorAll('code-block')).map(cb => {
-      const codeEl = cb.querySelector('code[data-test-id="code-content"]');
-      const langEl = cb.querySelector('.code-block-decoration span');
-      return codeEl ? {
-        language: langEl?.textContent.trim().toLowerCase() || '',
-        content: codeEl.textContent.trim()
-      } : null;
+      const code = cb.querySelector('code[data-test-id="code-content"]');
+      const lang = cb.querySelector('.code-block-decoration span');
+      return code ? { language: lang?.textContent.trim().toLowerCase() || '', content: code.textContent.trim() } : null;
     }).filter(Boolean);
   }
 
-  // --- Core Processing ---
+  // ===== メッセージ処理 =====
 
   async function processConversationContainer(container) {
+    if (!tabId) return;
     const turnId = container.id;
     if (!turnId || processedTurns.has(turnId)) return;
 
-    const shouldLog = await GemLogStorage.shouldLog(currentChatId);
-    if (!shouldLog) return;
+    const userEl  = container.querySelector('user-query');
+    const modelEl = container.querySelector('model-response');
 
-    const userQueryEl = container.querySelector('user-query');
-    const modelResponseEl = container.querySelector('model-response');
-
-    if (userQueryEl) {
-      const text = extractUserQuery(userQueryEl);
+    if (userEl) {
+      const text = extractUserQuery(userEl);
       if (text) {
-        const images = extractUserImages(userQueryEl);
-        await GemLogStorage.saveMessage(currentChatId, getChatTitle(), {
-          turnId,
-          role: 'user',
-          content: text,
-          images: images.length > 0 ? images : undefined,
+        const images = extractUserImages(userEl);
+        await GemLogSession.saveMessage(tabId, currentChatId, getChatTitle(), {
+          turnId, role: 'user', content: text,
+          images: images.length ? images : undefined,
           timestamp: new Date().toISOString()
         });
       }
     }
 
-    if (modelResponseEl) {
-      const responseContainer = modelResponseEl.querySelector('response-container');
-      if (!responseContainer || responseContainer.querySelector('[aria-busy="true"]')) return;
-
-      const text = extractModelResponse(modelResponseEl);
+    if (modelEl) {
+      const rc = modelEl.querySelector('response-container');
+      if (!rc || rc.querySelector('[aria-busy="true"]')) return;
+      const text = extractModelResponse(modelEl);
       if (text) {
-        const codeBlocks = extractCodeBlocks(modelResponseEl);
-        const saved = await GemLogStorage.saveMessage(currentChatId, getChatTitle(), {
-          turnId,
-          role: 'model',
-          content: text,
-          codeBlocks: codeBlocks.length > 0 ? codeBlocks : undefined,
+        const codeBlocks = extractCodeBlocks(modelEl);
+        const saved = await GemLogSession.saveMessage(tabId, currentChatId, getChatTitle(), {
+          turnId, role: 'model', content: text,
+          codeBlocks: codeBlocks.length ? codeBlocks : undefined,
           timestamp: new Date().toISOString()
         });
         if (saved) processedTurns.add(turnId);
@@ -123,42 +131,39 @@
 
   async function scanExistingConversations() {
     const containers = Array.from(document.querySelectorAll('.conversation-container'));
-    for (const container of containers) {
-      await processConversationContainer(container);
-    }
+    for (const c of containers) await processConversationContainer(c);
+
     const turnIds = containers.map(c => c.id).filter(Boolean);
-    if (turnIds.length > 0 && currentChatId) {
-      await GemLogStorage.syncDOMOrder(currentChatId, turnIds);
-    }
+    if (turnIds.length && tabId) await GemLogSession.syncDOMOrder(tabId, turnIds);
   }
 
-  // --- Toast UI ---
+  // ===== ページ内トースト =====
 
   function showPageToast(msg) {
-    let toast = document.getElementById('gemlog-next-toast');
-    if (!toast) {
-      toast = document.createElement('div');
-      toast.id = 'gemlog-next-toast';
-      toast.style.cssText = [
-        'position:fixed', 'top:20px', 'left:50%', 'transform:translateX(-50%)',
-        'background:#0a0e1a', 'color:#e2e8f0', 'padding:10px 20px',
-        'border-radius:20px', 'border:1px solid rgba(16,185,129,0.4)',
-        'z-index:9999', 'font-size:13px', 'font-weight:500',
-        'box-shadow:0 4px 20px rgba(0,0,0,0.4)', 'transition:opacity 0.3s',
+    let t = document.getElementById('gemlog-next-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'gemlog-next-toast';
+      t.style.cssText = [
+        'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
+        'background:#0a0e1a','color:#e2e8f0','padding:10px 20px',
+        'border-radius:20px','border:1px solid rgba(16,185,129,0.4)',
+        'z-index:9999','font-size:13px','font-weight:500',
+        'box-shadow:0 4px 20px rgba(0,0,0,0.4)','transition:opacity 0.3s',
         'backdrop-filter:blur(8px)'
       ].join(';');
-      document.body.appendChild(toast);
+      document.body.appendChild(t);
     }
-    toast.textContent = msg;
-    toast.style.opacity = '1';
+    t.textContent = msg;
+    t.style.opacity = '1';
   }
 
   function hidePageToast() {
-    const toast = document.getElementById('gemlog-next-toast');
-    if (toast) toast.style.opacity = '0';
+    const t = document.getElementById('gemlog-next-toast');
+    if (t) t.style.opacity = '0';
   }
 
-  // --- Auto Scroll ---
+  // ===== 過去ログの自動スクロール取得 =====
 
   async function autoScrollToTop() {
     const scroller = document.querySelector('infinite-scroller.chat-history')
@@ -168,9 +173,9 @@
     showPageToast(chrome.i18n.getMessage('toastAutoScrollStart'));
 
     let lastHeight = scroller.scrollHeight;
-    let retries = 0;
+    let retries    = 0;
 
-    const runScroll = async () => {
+    const run = async () => {
       scroller.scrollTop = 0;
       await new Promise(r => setTimeout(r, 1200));
 
@@ -178,7 +183,8 @@
         retries++;
         if (retries >= 3) {
           showPageToast(chrome.i18n.getMessage('toastAutoScrollReachedTop'));
-          await GemLogStorage.clearChatMessages(currentChatId);
+          // セッションをクリアして再スキャン
+          if (tabId) await GemLogSession.clear(tabId);
           processedTurns.clear();
           await scanExistingConversations();
           showPageToast(chrome.i18n.getMessage('toastAutoScrollDone'));
@@ -186,102 +192,101 @@
           return;
         }
       } else {
-        retries = 0;
+        retries    = 0;
         lastHeight = scroller.scrollHeight;
         showPageToast(chrome.i18n.getMessage('toastAutoScrollProgress') + lastHeight + 'px)');
       }
-
-      setTimeout(runScroll, 300);
+      setTimeout(run, 300);
     };
 
-    setTimeout(runScroll, 0);
+    setTimeout(run, 0);
   }
 
-  // --- MutationObservers ---
+  // ===== MutationObserver =====
 
   function startObserver() {
-    const chatContainer = document.querySelector('infinite-scroller.chat-history');
-    if (!chatContainer) return setTimeout(startObserver, 2000);
+    const chat = document.querySelector('infinite-scroller.chat-history');
+    if (!chat) return setTimeout(startObserver, 2000);
     if (observer) observer.disconnect();
 
-    observer = new MutationObserver(async (mutations) => {
-      let shouldSync = false;
-      for (const mutation of mutations) {
-        if (mutation.type !== 'childList') continue;
-        for (const node of mutation.addedNodes) {
+    observer = new MutationObserver(async mutations => {
+      let sync = false;
+      for (const m of mutations) {
+        if (m.type !== 'childList') continue;
+        for (const node of m.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
           if (node.classList?.contains('conversation-container')) {
             await processConversationContainer(node);
-            shouldSync = true;
+            sync = true;
           }
           const nested = node.querySelectorAll?.('.conversation-container');
-          if (nested?.length) {
-            for (const c of nested) await processConversationContainer(c);
-            shouldSync = true;
-          }
+          if (nested?.length) { for (const c of nested) await processConversationContainer(c); sync = true; }
           if (
             node.tagName === 'MESSAGE-CONTENT' ||
             node.classList?.contains('response-content') ||
             node.querySelector?.('message-content')
           ) {
-            const container = node.closest('.conversation-container');
-            if (container?.id && !processedTurns.has(container.id)) {
-              setTimeout(() => {
-                processConversationContainer(container);
-                scanExistingConversations();
-              }, 500);
+            const c = node.closest('.conversation-container');
+            if (c?.id && !processedTurns.has(c.id)) {
+              setTimeout(() => { processConversationContainer(c); scanExistingConversations(); }, 500);
             }
           }
         }
       }
-      if (shouldSync) setTimeout(scanExistingConversations, 500);
+      if (sync) setTimeout(scanExistingConversations, 500);
     });
 
-    observer.observe(chatContainer, { childList: true, subtree: true });
+    observer.observe(chat, { childList: true, subtree: true });
     scanExistingConversations();
   }
 
   function startBusyObserver() {
-    const chatArea = document.querySelector('infinite-scroller.chat-history');
-    if (!chatArea) return;
+    const chat = document.querySelector('infinite-scroller.chat-history');
+    if (!chat) return;
     if (busyObserver) busyObserver.disconnect();
 
-    busyObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'attributes' && mutation.attributeName === 'aria-busy') {
-          if (mutation.target.getAttribute('aria-busy') === 'false') {
-            const container = mutation.target.closest('.conversation-container');
-            if (container?.id && !processedTurns.has(container.id)) {
-              setTimeout(() => {
-                processConversationContainer(container);
-                scanExistingConversations();
-              }, 300);
-            }
+    busyObserver = new MutationObserver(mutations => {
+      for (const m of mutations) {
+        if (m.type === 'attributes' && m.attributeName === 'aria-busy' &&
+            m.target.getAttribute('aria-busy') === 'false') {
+          const c = m.target.closest('.conversation-container');
+          if (c?.id && !processedTurns.has(c.id)) {
+            setTimeout(() => { processConversationContainer(c); scanExistingConversations(); }, 300);
           }
         }
       }
     });
 
-    busyObserver.observe(chatArea, { attributes: true, attributeFilter: ['aria-busy'], subtree: true });
+    busyObserver.observe(chat, { attributes: true, attributeFilter: ['aria-busy'], subtree: true });
   }
 
+  /**
+   * SPA内のURL変化を監視する。
+   * 別チャットに移動したら: セッションを削除して新チャットの記録を開始。
+   */
   function watchURLChanges() {
     let lastURL = location.href;
-    new MutationObserver(() => {
-      if (location.href !== lastURL) {
-        lastURL = location.href;
-        currentChatId = getChatIdFromURL();
+
+    new MutationObserver(async () => {
+      if (location.href === lastURL) return;
+      lastURL = location.href;
+
+      const newChatId = getChatIdFromURL();
+      if (newChatId !== currentChatId) {
+        // 別チャットへ移動 → 前のセッションを削除
+        if (tabId) await GemLogSession.clear(tabId);
         processedTurns.clear();
+        currentChatId = newChatId;
         setTimeout(scanExistingConversations, 1000);
       }
     }).observe(document.body, { childList: true, subtree: true });
   }
 
-  // --- Message Handler ---
+  // ===== Popup からのメッセージ =====
 
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     if (request.action === 'getStatus') {
-      sendResponse({ active: true, chatId: currentChatId, processedTurns: processedTurns.size });
+      sendResponse({ active: true, tabId, chatId: currentChatId, processedTurns: processedTurns.size });
     } else if (request.action === 'forceScan') {
       scanExistingConversations().then(() => sendResponse({ success: true }));
     } else if (request.action === 'autoScroll') {
@@ -291,22 +296,21 @@
     return true;
   });
 
-  // --- Init ---
+  // ===== 拡張機能の開始 =====
 
-  function init() {
-    currentChatId = getChatIdFromURL();
+  function startExtension() {
     if (document.querySelector('infinite-scroller.chat-history')) {
       startObserver();
       startBusyObserver();
     } else {
-      const initObserver = new MutationObserver((_, obs) => {
+      const io = new MutationObserver((_, obs) => {
         if (document.querySelector('infinite-scroller.chat-history')) {
           obs.disconnect();
           startObserver();
           startBusyObserver();
         }
       });
-      initObserver.observe(document.body, { childList: true, subtree: true });
+      io.observe(document.body, { childList: true, subtree: true });
     }
     watchURLChanges();
   }
