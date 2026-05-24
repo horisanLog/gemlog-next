@@ -1,194 +1,425 @@
 /**
- * GemLog Next — Popup Main Controller (Session-based)
- *
- * セキュリティ設計:
- *   - 永続ストレージを使用しない
- *   - 現在開いているGeminiタブのセッションのみ表示
- *   - ダウンロードはユーザーが明示的に選択したものだけ
+ * GemLog Next — Popup / Side Panel Controller
  */
 import { applyTranslations, showToast, downloadFile, formatDate, escapeHtml, sanitizeFilename, isValidHttpsUrl } from './utils.js';
 
 // ===== 状態管理 =====
-let selectedTabIds = new Set();
-let allSessions    = [];
-let refreshTimer   = null;
+let currentSession  = null;
+let sidebarList     = [];          // Gemini サイドバーから取得した会話一覧
+let selectedChatIds = new Set();
+let viewMode        = 'current';   // 'current' | 'select'
+let refreshTimer    = null;
 
-// ===== セッション一覧の取得と描画 =====
+// バルクダウンロード状態（null = アイドル）
+let bulkState = null;
 
-async function loadSessions() {
-  // 開いている全Geminiタブを取得
-  const geminiTabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
-  const tabMap     = Object.fromEntries(geminiTabs.map(t => [t.id, t]));
+// 現在のチャットのスクロール&ダウンロード状態
+let currentScrollState = null;
+/* { tabId, format, waitingForScroll, scrollTimeout } */
+/* {
+     tabId: number,
+     queue: [{chatId, title, url}],
+     format: string,
+     completed: number,
+     failed: number,
+     waitingForScroll: boolean,
+     scrollTimeout: id | null
+   } */
 
-  // セッションデータを取得
-  const sessions = await GemLogSession.getAll();
-
-  // 存在するタブのセッションのみ表示（孤立セッションは除外）
-  allSessions = sessions
-    .filter(s => tabMap[s.tabId])
-    .map(s => ({ ...s, tab: tabMap[s.tabId] }))
-    .sort((a, b) => new Date(b.updatedAt || b.startedAt) - new Date(a.updatedAt || a.startedAt));
-
-  // 選択済みセットを有効なタブIDに絞る
-  const validIds = new Set(allSessions.map(s => s.tabId));
-  selectedTabIds = new Set([...selectedTabIds].filter(id => validIds.has(id)));
-
-  renderSessionList();
-  updateDownloadButton();
-  await updateStorageUsage();
+// ===== ビュー切替 =====
+function switchView(mode) {
+  viewMode = mode;
+  document.getElementById('currentView').style.display = mode === 'current' ? '' : 'none';
+  document.getElementById('selectView').style.display  = mode === 'select'  ? '' : 'none';
 }
 
-function renderSessionList() {
-  const container = document.getElementById('sessionList');
+// ===== 現在のチャット（デフォルトビュー）=====
 
-  if (allSessions.length === 0) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">💬</div>
-        <div class="empty-title" data-i18n="noSessionsTitle">Geminiのタブが開いていません</div>
-        <div class="empty-sub" data-i18n="noSessionsSub">Geminiでチャットを始めると、セッションが表示されます</div>
-        <div class="empty-hint" data-i18n="noSessionsHint">→ gemini.google.com を開いてください</div>
-      </div>`;
-    applyTranslations();
+async function loadCurrentTab() {
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const isGemini = activeTab?.url?.startsWith('https://gemini.google.com/');
+
+  if (!isGemini) {
+    currentSession = null;
+    renderCurrentCard(null);
+    document.getElementById('currentDownloadBtn').disabled = true;
     return;
   }
 
-  container.innerHTML = allSessions.map((s, i) => {
-    const isSelected = selectedTabIds.has(s.tabId);
-    const count      = s.messageCount || s.messages?.length || 0;
-    const time       = s.updatedAt ? formatDate(s.updatedAt) : formatDate(s.startedAt);
-    const title      = s.title || chrome.i18n.getMessage('untitledChat');
+  const allData = await GemLogSession.getAll();
+  const found   = allData.find(s => s.tabId === activeTab.id);
 
-    return `
-      <div class="session-item${isSelected ? ' selected' : ''}" data-tabid="${s.tabId}" style="animation-delay:${i * 40}ms">
-        <input type="checkbox" class="session-checkbox" data-tabid="${s.tabId}" ${isSelected ? 'checked' : ''}>
-        <div class="session-info">
-          <div class="session-title">${escapeHtml(title)}</div>
-          <div class="session-meta">
-            <span class="msg-badge">${count} ${chrome.i18n.getMessage('itemCount')}</span>
-            <span class="dot">·</span>
-            <span>${time}</span>
-            <span class="dot">·</span>
-            <span>Tab ${s.tabId}</span>
-          </div>
-        </div>
-        <div class="session-actions">
-          <button class="btn xs single-dl-btn" data-tabid="${s.tabId}" title="Download this session">⬇</button>
-        </div>
+  currentSession = found
+    ? { ...found, tab: activeTab }
+    : {
+        tabId:        activeTab.id,
+        tab:          activeTab,
+        title:        (activeTab.title || '').replace(/\s*[-–]\s*(Gemini|Google).*$/i, '').trim() || 'Gemini',
+        messages:     [],
+        messageCount: 0,
+        noData:       true
+      };
+
+  renderCurrentCard(currentSession);
+  document.getElementById('currentDownloadBtn').disabled = false;
+}
+
+function renderCurrentCard(session) {
+  const wrap = document.getElementById('currentCardWrap');
+  if (!session) {
+    wrap.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">💬</div>
+        <div class="empty-title" data-i18n="noSessionsTitle"></div>
+        <div class="empty-sub"  data-i18n="noSessionsSub"></div>
+        <div class="empty-hint" data-i18n="noSessionsHint"></div>
       </div>`;
-  }).join('');
+    applyTranslations();
+    document.getElementById('currentDownloadBtn').disabled = true;
+    return;
+  }
+  const count = session.messageCount || session.messages?.length || 0;
+  const time  = session.updatedAt  ? formatDate(session.updatedAt)
+              : session.startedAt  ? formatDate(session.startedAt) : '—';
+  wrap.innerHTML = `
+    <div class="current-card">
+      <div class="card-title">${escapeHtml(session.title)}</div>
+      <div class="card-meta">
+        <span class="msg-badge">${count} ${chrome.i18n.getMessage('itemCount')}</span>
+        <span class="dot">·</span>
+        <span>${time}</span>
+      </div>
+      ${count === 0 ? `<div class="card-notice">💡 メッセージを取得中です。会話後にリフレッシュしてください。</div>` : ''}
+    </div>`;
+}
 
-  // イベント: チェックボックス
-  container.querySelectorAll('.session-checkbox').forEach(chk => {
+// ===== 選択ビュー: Gemini サイドバー一覧 =====
+
+async function loadSelectView() {
+  const list = document.getElementById('sessionList');
+  list.innerHTML = '<div class="loading-msg">⏳ Geminiサイドバーを読み込み中...</div>';
+  selectedChatIds.clear();
+  updateDownloadButton();
+  updateSelectAllCheckbox();
+
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*', currentWindow: true });
+    if (!tabs.length) {
+      showSelectEmpty('Geminiのタブが開いていません');
+      return;
+    }
+
+    const resp = await chrome.tabs.sendMessage(tabs[0].id, { action: 'getSidebarList' });
+    sidebarList = resp?.conversations || [];
+    renderSidebarList();
+  } catch {
+    showSelectEmpty('取得に失敗しました。Geminiタブを開いて再試行してください。');
+  }
+}
+
+function showSelectEmpty(msg) {
+  document.getElementById('sessionList').innerHTML = `
+    <div class="empty-state">
+      <div class="empty-icon">💬</div>
+      <div class="empty-title">${escapeHtml(msg)}</div>
+    </div>`;
+  updateDownloadButton();
+}
+
+function renderSidebarList() {
+  const list = document.getElementById('sessionList');
+  if (!sidebarList.length) {
+    showSelectEmpty('サイドバーに会話が見つかりません');
+    return;
+  }
+
+  list.innerHTML = sidebarList.map((c, i) => `
+    <div class="session-item${selectedChatIds.has(c.chatId) ? ' selected' : ''}${c.current ? ' is-current' : ''}"
+         data-chatid="${escapeHtml(c.chatId)}" style="animation-delay:${i * 25}ms">
+      <input type="checkbox" class="session-checkbox" data-chatid="${escapeHtml(c.chatId)}"
+             ${selectedChatIds.has(c.chatId) ? 'checked' : ''}>
+      <div class="session-info">
+        <div class="session-title">${escapeHtml(c.title)}</div>
+        ${c.current ? '<div class="session-meta"><span class="current-badge">現在のチャット</span></div>' : ''}
+      </div>
+    </div>`).join('');
+
+  list.querySelectorAll('.session-checkbox').forEach(chk => {
     chk.addEventListener('change', () => {
-      const id = parseInt(chk.dataset.tabid);
-      if (chk.checked) selectedTabIds.add(id);
-      else              selectedTabIds.delete(id);
-
-      // カードの selected クラスを更新
+      const id = chk.dataset.chatid;
+      chk.checked ? selectedChatIds.add(id) : selectedChatIds.delete(id);
       chk.closest('.session-item').classList.toggle('selected', chk.checked);
       updateDownloadButton();
       updateSelectAllCheckbox();
     });
   });
 
-  // イベント: カードクリック（チェックボックス以外の領域）
-  container.querySelectorAll('.session-item').forEach(item => {
+  list.querySelectorAll('.session-item').forEach(item => {
     item.addEventListener('click', e => {
-      if (e.target.classList.contains('session-checkbox') ||
-          e.target.closest('.session-actions')) return;
+      if (e.target.classList.contains('session-checkbox')) return;
       const chk = item.querySelector('.session-checkbox');
       chk.checked = !chk.checked;
       chk.dispatchEvent(new Event('change'));
     });
   });
 
-  // イベント: 単体ダウンロードボタン
-  container.querySelectorAll('.single-dl-btn').forEach(btn => {
-    btn.addEventListener('click', async e => {
-      e.stopPropagation();
-      const tabId = parseInt(btn.dataset.tabid);
-      const s     = allSessions.find(x => x.tabId === tabId);
-      if (s) await downloadSessions([s]);
-    });
-  });
-
   updateSelectAllCheckbox();
+  updateDownloadButton();
 }
 
 function updateDownloadButton() {
-  const btn   = document.getElementById('downloadBtn');
-  const count = selectedTabIds.size;
-  btn.disabled  = count === 0;
-  btn.textContent = `⬇ ${chrome.i18n.getMessage('btnDownloadLabel')} (${count})`;
+  const btn = document.getElementById('downloadBtn');
+  const n   = selectedChatIds.size;
+  btn.disabled    = n === 0 || !!bulkState;
+  btn.textContent = `⬇ ダウンロード (${n})`;
 }
 
 function updateSelectAllCheckbox() {
-  const chk = document.getElementById('selectAllChk');
-  if (allSessions.length === 0) {
-    chk.checked       = false;
-    chk.indeterminate = false;
-  } else if (selectedTabIds.size === allSessions.length) {
-    chk.checked       = true;
-    chk.indeterminate = false;
-  } else if (selectedTabIds.size > 0) {
-    chk.checked       = false;
-    chk.indeterminate = true;
-  } else {
-    chk.checked       = false;
-    chk.indeterminate = false;
+  const chk   = document.getElementById('selectAllChk');
+  const total = sidebarList.length;
+  if (!total)                              { chk.checked = false; chk.indeterminate = false; }
+  else if (selectedChatIds.size === total) { chk.checked = true;  chk.indeterminate = false; }
+  else if (selectedChatIds.size > 0)      { chk.checked = false; chk.indeterminate = true;  }
+  else                                    { chk.checked = false; chk.indeterminate = false; }
+}
+
+// ===== バルクダウンロード（遷移 → autoScroll → キャプチャ → DL）=====
+
+async function startBulkDownload() {
+  if (bulkState) return;
+  const targets = sidebarList.filter(c => selectedChatIds.has(c.chatId));
+  if (!targets.length) return;
+
+  const format = document.getElementById('downloadFormatBulk').value;
+  const tabs   = await chrome.tabs.query({ url: 'https://gemini.google.com/*', currentWindow: true });
+  if (!tabs.length) { showToast('Geminiのタブが見つかりません'); return; }
+
+  bulkState = {
+    tabId:            tabs[0].id,
+    queue:            [...targets],
+    format,
+    completed:        0,
+    failed:           0,
+    waitingForScroll: false,
+    scrollTimeout:    null
+  };
+
+  document.getElementById('downloadBtn').disabled      = true;
+  document.getElementById('selectAllChk').disabled     = true;
+  document.getElementById('sessionList').style.opacity = '0.45';
+  document.getElementById('bulkCancelBtn').style.display = '';
+
+  processNextInQueue();
+}
+
+async function processNextInQueue() {
+  if (!bulkState) return;
+
+  if (!bulkState.queue.length) {
+    // 全件完了
+    const { completed, failed } = bulkState;
+    bulkState = null;
+    document.getElementById('selectAllChk').disabled      = false;
+    document.getElementById('sessionList').style.opacity  = '';
+    document.getElementById('bulkCancelBtn').style.display = 'none';
+    updateDownloadButton();
+    showToast(
+      `✅ ${completed}件ダウンロード完了${failed ? `（${failed}件失敗）` : ''}`,
+      5000
+    );
+    return;
+  }
+
+  const next  = bulkState.queue.shift();
+  const done  = bulkState.completed + bulkState.failed;
+  const total = done + bulkState.queue.length + 1;
+  showToast(`📥 (${done + 1}/${total}) ${next.title}`, 120000);
+
+  // 1. 対象 URL へ遷移
+  try {
+    await chrome.tabs.update(bulkState.tabId, { url: next.url });
+  } catch {
+    bulkState.failed++;
+    processNextInQueue();
+    return;
+  }
+
+  // 2. ページロード + content script 初期化を待つ
+  await new Promise(r => setTimeout(r, 3000));
+
+  // 3. scroll シグナル待機フラグを立ててからタイムアウトをセット
+  bulkState.waitingForScroll = true;
+  bulkState.scrollTimeout    = setTimeout(onScrollDone, 180000); // 3分タイムアウト
+
+  // 4. autoScroll 送信（ページトップまでスクロールして全履歴取得）
+  let sent = false;
+  for (let i = 0; i < 3 && !sent; i++) {
+    try {
+      await chrome.tabs.sendMessage(bulkState.tabId, { action: 'autoScroll' });
+      sent = true;
+    } catch {
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+
+  if (!sent) {
+    // content script に届かなかった
+    if (bulkState.scrollTimeout) { clearTimeout(bulkState.scrollTimeout); bulkState.scrollTimeout = null; }
+    bulkState.waitingForScroll = false;
+    bulkState.failed++;
+    processNextInQueue();
   }
 }
 
-// ===== ダウンロード =====
+// autoScroll 完了時（storage.onChanged または タイムアウト）
+async function onScrollDone() {
+  if (!bulkState?.waitingForScroll) return; // 二重呼び出し防止
+  bulkState.waitingForScroll = false;
+  if (bulkState.scrollTimeout) { clearTimeout(bulkState.scrollTimeout); bulkState.scrollTimeout = null; }
 
-async function downloadSessions(sessions) {
-  if (!sessions.length) return;
-
-  const format = document.getElementById('downloadFormat').value;
-
-  for (let i = 0; i < sessions.length; i++) {
-    const s        = sessions[i];
-    const safeName = sanitizeFilename(s.title || 'chat');
-    const date     = (s.startedAt || new Date().toISOString()).split('T')[0];
-    const filename = `${safeName}_${date}`;
-
-    let content, mime;
-    if (format === 'json') {
-      content = GemLogSession.chatToJSON(s);
-      mime    = 'application/json';
-      downloadFile(`${filename}.json`, content, mime);
-    } else if (format === 'obsidian') {
-      content = GemLogSession.chatToObsidian(s);
-      mime    = 'text/markdown';
-      downloadFile(`${filename}.md`, content, mime);
-    } else {
-      content = GemLogSession.chatToMarkdown(s);
-      mime    = 'text/markdown';
-      downloadFile(`${filename}.md`, content, mime);
-    }
-
-    // 複数ファイルを連続ダウンロードする場合に少し間隔を空ける
-    if (i < sessions.length - 1) {
-      await new Promise(r => setTimeout(r, 250));
-    }
+  const session = await GemLogSession.get(bulkState.tabId);
+  if (session?.messages?.length > 0) {
+    downloadOneSession(session, bulkState.format);
+    bulkState.completed++;
+  } else {
+    bulkState.failed++;
   }
 
-  showToast(`${sessions.length} ${chrome.i18n.getMessage('toastDownloaded')}`);
+  await new Promise(r => setTimeout(r, 500));
+  processNextInQueue();
+}
+
+// background が session ストレージに立てたシグナルを検知
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'session') return;
+  for (const key of Object.keys(changes)) {
+    if (!key.startsWith('gemlog_scrolldone_') || !changes[key].newValue) continue;
+    const tid = parseInt(key.replace('gemlog_scrolldone_', ''), 10);
+
+    if (bulkState?.waitingForScroll && tid === bulkState.tabId) {
+      chrome.storage.session.remove(key);
+      onScrollDone();
+      break;
+    }
+    if (currentScrollState?.waitingForScroll && tid === currentScrollState.tabId) {
+      chrome.storage.session.remove(key);
+      onCurrentScrollDone();
+      break;
+    }
+  }
+});
+
+// ===== 現在のチャット: スクロール完了 / キャンセル =====
+
+async function onCurrentScrollDone() {
+  if (!currentScrollState?.waitingForScroll) return;
+  currentScrollState.waitingForScroll = false;
+  if (currentScrollState.scrollTimeout) {
+    clearTimeout(currentScrollState.scrollTimeout);
+    currentScrollState.scrollTimeout = null;
+  }
+
+  const { tabId, format } = currentScrollState;
+  currentScrollState = null;
+  document.getElementById('currentCancelBtn').style.display = 'none';
+  document.getElementById('currentDownloadBtn').disabled    = false;
+
+  const session = await GemLogSession.get(tabId);
+  if (session?.messages?.length > 0) {
+    downloadOneSession(session, format);
+    showToast(`1 ${chrome.i18n.getMessage('toastDownloaded')}`);
+    currentSession = { ...session };
+    renderCurrentCard(currentSession);
+  } else {
+    showToast('メッセージが取得できませんでした');
+  }
+}
+
+function cancelCurrentDownload() {
+  if (!currentScrollState) return;
+  const tabId = currentScrollState.tabId;
+  if (currentScrollState.scrollTimeout) clearTimeout(currentScrollState.scrollTimeout);
+  currentScrollState = null;
+  document.getElementById('currentCancelBtn').style.display = 'none';
+  document.getElementById('currentDownloadBtn').disabled    = false;
+  chrome.tabs.sendMessage(tabId, { action: 'stopScroll' }).catch(() => {});
+  showToast('ダウンロードを中止しました');
+}
+
+function cancelBulkDownload() {
+  if (!bulkState) return;
+  if (bulkState.scrollTimeout) clearTimeout(bulkState.scrollTimeout);
+  const { completed, failed, tabId } = bulkState;
+  bulkState = null;
+  if (tabId) chrome.tabs.sendMessage(tabId, { action: 'stopScroll' }).catch(() => {});
+  document.getElementById('selectAllChk').disabled      = false;
+  document.getElementById('sessionList').style.opacity  = '';
+  document.getElementById('bulkCancelBtn').style.display = 'none';
+  updateDownloadButton();
+  showToast(
+    `中止しました（完了 ${completed}件${failed ? `・失敗 ${failed}件` : ''}）`,
+    4000
+  );
+}
+
+// ===== ダウンロード共通 =====
+
+function downloadOneSession(session, format) {
+  const safeName = sanitizeFilename(session.title || 'chat');
+  const date     = (session.startedAt || new Date().toISOString()).split('T')[0];
+  const filename  = `${safeName}_${date}`;
+  let content, mime;
+  if (format === 'json') {
+    content = GemLogSession.chatToJSON(session);     mime = 'application/json';
+    downloadFile(`${filename}.json`, content, mime);
+  } else if (format === 'obsidian') {
+    content = GemLogSession.chatToObsidian(session); mime = 'text/markdown';
+    downloadFile(`${filename}.md`, content, mime);
+  } else {
+    content = GemLogSession.chatToMarkdown(session); mime = 'text/markdown';
+    downloadFile(`${filename}.md`, content, mime);
+  }
+}
+
+async function downloadCurrentSession() {
+  if (currentScrollState) return; // スクロール中は二重実行禁止
+
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!activeTab?.url?.startsWith('https://gemini.google.com/')) {
+    showToast('Geminiのタブが開いていません'); return;
+  }
+
+  const format = document.getElementById('downloadFormat').value;
+  const btn    = document.getElementById('currentDownloadBtn');
+  btn.disabled = true;
+  showToast('⏳ 全履歴をスクロール取得中...', 120000);
+
+  currentScrollState = {
+    tabId:            activeTab.id,
+    format,
+    waitingForScroll: true,
+    scrollTimeout:    setTimeout(onCurrentScrollDone, 180000)
+  };
+  document.getElementById('currentCancelBtn').style.display = '';
+
+  try {
+    await chrome.tabs.sendMessage(activeTab.id, { action: 'autoScroll' });
+  } catch {
+    cancelCurrentDownload();
+    showToast('スクロールの送信に失敗しました');
+  }
 }
 
 // ===== ストレージ使用量 =====
 
 async function updateStorageUsage() {
   try {
-    // chrome.storage.session の使用量（getBytesInUse はセッションも対応）
     const bytes   = await new Promise(r => chrome.storage.session.getBytesInUse(null, r));
     const kb      = (bytes / 1024).toFixed(1);
-    const percent = Math.min((bytes / (10 * 1024 * 1024)) * 100, 100); // 上限10MB
+    const percent = Math.min((bytes / (10 * 1024 * 1024)) * 100, 100);
     document.getElementById('storageUsage').textContent = `${kb} KB / 10 MB`;
     document.getElementById('storageBar').style.width   = `${percent.toFixed(1)}%`;
   } catch {
-    // getBytesInUse が session に未対応の Chrome バージョン対策
     document.getElementById('storageUsage').textContent = '—';
   }
 }
@@ -197,11 +428,13 @@ async function updateStorageUsage() {
 
 async function loadSettings() {
   const s = await GemLogSettings.get();
-  document.getElementById('apiProvider').value  = s.apiProvider;
-  document.getElementById('apiKey').value       = s.apiKey || '';
-  document.getElementById('apiModel').value     = s.apiModel || '';
-  document.getElementById('apiEndpoint').value  = s.apiEndpoint || '';
-  document.getElementById('exportFormat').value = s.exportFormat || 'markdown';
+  document.getElementById('apiProvider').value        = s.apiProvider;
+  document.getElementById('apiKey').value             = s.apiKey || '';
+  document.getElementById('apiModel').value           = s.apiModel || '';
+  document.getElementById('apiEndpoint').value        = s.apiEndpoint || '';
+  document.getElementById('exportFormat').value       = s.exportFormat || 'markdown';
+  document.getElementById('downloadFormat').value     = s.exportFormat || 'markdown';
+  document.getElementById('downloadFormatBulk').value = s.exportFormat || 'markdown';
   toggleApiFields(s.apiProvider);
   validateEndpointUrl();
 }
@@ -209,20 +442,19 @@ async function loadSettings() {
 async function saveSettings() {
   const provider = document.getElementById('apiProvider').value;
   const endpoint = document.getElementById('apiEndpoint').value.trim();
-
   if (provider === 'custom' && endpoint && !isValidHttpsUrl(endpoint)) {
-    showToast(chrome.i18n.getMessage('errEndpointNotHttps'));
-    return;
+    showToast(chrome.i18n.getMessage('errEndpointNotHttps')); return;
   }
-
+  const exportFormat = document.getElementById('exportFormat').value;
   await GemLogSettings.save({
     apiProvider:  provider,
     apiKey:       document.getElementById('apiKey').value,
     apiModel:     document.getElementById('apiModel').value,
     apiEndpoint:  endpoint,
-    exportFormat: document.getElementById('exportFormat').value
+    exportFormat
   });
-
+  document.getElementById('downloadFormat').value     = exportFormat;
+  document.getElementById('downloadFormatBulk').value = exportFormat;
   showToast(chrome.i18n.getMessage('toastSettingsSaved'));
 }
 
@@ -236,26 +468,25 @@ function validateEndpointUrl() {
   const status = document.getElementById('urlStatus');
   const error  = document.getElementById('endpointError');
   const value  = input.value.trim();
-
   if (!value) {
     status.textContent = ''; status.className = 'url-status';
     error.classList.remove('visible'); input.classList.remove('error');
-    return true;
+    return;
   }
   if (isValidHttpsUrl(value)) {
     status.textContent = '✓ Valid HTTPS URL'; status.className = 'url-status valid';
     error.classList.remove('visible'); input.classList.remove('error');
-    return true;
+  } else {
+    status.textContent = '✗ Invalid'; status.className = 'url-status invalid';
+    error.classList.add('visible'); input.classList.add('error');
   }
-  status.textContent = '✗ Invalid'; status.className = 'url-status invalid';
-  error.classList.add('visible'); input.classList.add('error');
-  return false;
 }
 
 // ===== タブ切替 =====
 
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.panel').forEach(p => {
     const active = p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1);
     p.classList.toggle('active', active);
@@ -263,11 +494,16 @@ function switchTab(name) {
   });
 }
 
-// ===== 自動リフレッシュ =====
+// ===== 自動リフレッシュ（currentView のみ）=====
 
 function startAutoRefresh() {
   stopAutoRefresh();
-  refreshTimer = setInterval(loadSessions, 5000);
+  refreshTimer = setInterval(() => {
+    if (viewMode === 'current') {
+      loadCurrentTab();
+      updateStorageUsage();
+    }
+  }, 5000);
 }
 
 function stopAutoRefresh() {
@@ -276,33 +512,39 @@ function stopAutoRefresh() {
 
 // ===== イベントリスナー =====
 
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => switchTab(tab.dataset.tab));
-});
+document.querySelectorAll('.tab').forEach(tab =>
+  tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
 document.getElementById('refreshBtn').addEventListener('click', () => {
-  loadSessions();
+  if (viewMode === 'current') loadCurrentTab();
+  else if (!bulkState)        loadSelectView(); // ダウンロード中は再読み込み禁止
   showToast(chrome.i18n.getMessage('toastRescanned'));
 });
 
-// セッションパネルの「すべて選択」
+document.getElementById('currentDownloadBtn').addEventListener('click', downloadCurrentSession);
+
+document.getElementById('selectModeBtn').addEventListener('click', () => {
+  switchView('select');
+  loadSelectView();
+});
+
+document.getElementById('backBtn').addEventListener('click', () => {
+  if (bulkState) return; // ダウンロード中は戻れない
+  switchView('current');
+  loadCurrentTab();
+});
+
 document.getElementById('selectAllChk').addEventListener('change', e => {
-  if (e.target.checked) {
-    selectedTabIds = new Set(allSessions.map(s => s.tabId));
-  } else {
-    selectedTabIds.clear();
-  }
-  renderSessionList();
+  if (e.target.checked) selectedChatIds = new Set(sidebarList.map(c => c.chatId));
+  else                  selectedChatIds.clear();
+  renderSidebarList();
   updateDownloadButton();
 });
 
-// ダウンロードボタン
-document.getElementById('downloadBtn').addEventListener('click', async () => {
-  const targets = allSessions.filter(s => selectedTabIds.has(s.tabId));
-  await downloadSessions(targets);
-});
+document.getElementById('downloadBtn').addEventListener('click', startBulkDownload);
+document.getElementById('currentCancelBtn').addEventListener('click', cancelCurrentDownload);
+document.getElementById('bulkCancelBtn').addEventListener('click', cancelBulkDownload);
 
-// 設定
 document.getElementById('apiProvider').addEventListener('change', e => toggleApiFields(e.target.value));
 document.getElementById('apiEndpoint').addEventListener('input',  validateEndpointUrl);
 document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
@@ -310,19 +552,19 @@ document.getElementById('saveSettingsBtn').addEventListener('click', saveSetting
 document.getElementById('apiKeyToggle').addEventListener('click', () => {
   const input = document.getElementById('apiKey');
   const btn   = document.getElementById('apiKeyToggle');
-  input.type       = input.type === 'password' ? 'text' : 'password';
-  btn.textContent  = input.type === 'password' ? '👁' : '🙈';
+  input.type      = input.type === 'password' ? 'text' : 'password';
+  btn.textContent = input.type === 'password' ? '👁' : '🙈';
 });
 
 // ===== 初期化 =====
 
 async function init() {
   applyTranslations();
+  switchView('current');
   await loadSettings();
-  await loadSessions();
+  await loadCurrentTab();
+  await updateStorageUsage();
   startAutoRefresh();
-
-  // popupが閉じたら自動リフレッシュを停止
   window.addEventListener('unload', stopAutoRefresh);
 }
 

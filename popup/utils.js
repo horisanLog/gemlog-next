@@ -61,5 +61,8 @@ export function isValidHttpsUrl(value) {
 
 /** ファイル名に使えない文字を除去する */
 export function sanitizeFilename(name, maxLen = 50) {
-  return (name || 'chat').replace(/[/\\:*?"<>|]/g, '_').substring(0, maxLen);
+  return ((name || 'chat')
+    .replace(/[\x00-\x1f/\\:*?"<>|]/g, '_')
+    .trim()
+    .substring(0, maxLen)) || 'chat';
 }

@@ -2,11 +2,18 @@
  * GemLog Next — Background Service Worker
  *
  * 役割:
- *   1. content scriptにtab IDを返す
- *   2. ポート切断 → セッションを自動削除（ページ離脱・tab close検出）
- *   3. tab close → セッションを削除（onRemoved）
+ *   1. ポート接続でセッションマーカーを作成・管理
+ *   2. content script からのメッセージを受け取りストレージへ保存
+ *   3. tab close → セッションを削除
  *   4. AI要約リクエストの処理
  */
+
+importScripts('lib/storage-manager.js');
+
+// ===== サイドパネルの開閉 =====
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch(() => {});
 
 // ===== インストール時の初期設定 =====
 chrome.runtime.onInstalled.addListener(details => {
@@ -23,17 +30,35 @@ chrome.runtime.onInstalled.addListener(details => {
   }
 });
 
-// ===== ポート管理: 切断時にセッションを削除 =====
-// content.js が接続し、ページ離脱またはtabクローズ時に自動切断される
+// ===== ポート管理: content.js の接続を受け取りセッションを管理 =====
 chrome.runtime.onConnect.addListener(port => {
-  const match = port.name.match(/^gemlog-session-(\d+)$/);
-  if (!match) return;
+  const tabId = port.sender?.tab?.id;
+  if (!tabId) return;
 
-  const tabId = parseInt(match[1], 10);
+  // ポート名に関わらず tabId で管理する
+  const key = `gemlog_session_${tabId}`;
+
+  // セッションマーカーを作成（まだなければ）
+  chrome.storage.session.get(key).then(existing => {
+    if (!existing[key]) {
+      const rawTitle = (port.sender.tab.title || '')
+        .replace(/\s*[-–]\s*(Gemini|Google).*$/i, '')
+        .trim();
+      chrome.storage.session.set({
+        [key]: {
+          tabId,
+          chatId:       'unknown',
+          title:        rawTitle || 'Gemini',
+          messages:     [],
+          messageCount: 0,
+          startedAt:    new Date().toISOString()
+        }
+      });
+    }
+  });
 
   port.onDisconnect.addListener(() => {
-    // ページ離脱 or tab close → セッションデータを削除
-    chrome.storage.session.remove(`gemlog_session_${tabId}`);
+    chrome.storage.session.remove(key);
   });
 });
 
@@ -55,18 +80,51 @@ function isValidHttpsUrl(url) {
 // ===== メッセージハンドラ =====
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
-  // content script から tab ID を要求
-  if (request.action === 'getTabId') {
-    sendResponse({ tabId: sender.tab?.id ?? null });
+  const tabId = sender.tab?.id;
+
+  // content script からのメッセージ保存
+  if (request.action === 'sessionSaveMessage') {
+    if (!tabId) { sendResponse({ success: false }); return false; }
+    GemLogSession.saveMessage(tabId, request.chatId, request.chatTitle, request.message)
+      .then(saved => sendResponse({ success: saved }))
+      .catch(() => sendResponse({ success: false }));
+    return true;
+  }
+
+  // content script からのセッション削除
+  if (request.action === 'clearSession') {
+    if (!tabId) { sendResponse({ success: false }); return false; }
+    GemLogSession.clear(tabId)
+      .then(() => sendResponse({ success: true }))
+      .catch(() => sendResponse({ success: false }));
+    return true;
+  }
+
+  // content script からの並び替え
+  if (request.action === 'sessionSyncOrder') {
+    if (!tabId) { sendResponse({ success: false }); return false; }
+    GemLogSession.syncDOMOrder(tabId, request.turnIds)
+      .then(() => sendResponse({ success: true }))
+      .catch(() => sendResponse({ success: false }));
+    return true;
+  }
+
+  // autoScroll 完了通知 → session ストレージにシグナルを立てる
+  if (request.action === 'autoScrollComplete') {
+    if (tabId) {
+      chrome.storage.session.set({ [`gemlog_scrolldone_${tabId}`]: Date.now() });
+    }
+    sendResponse({ success: true });
     return false;
   }
 
-  // AI要約リクエスト
+  // AI要約リクエスト（APIキーはストレージから取得し、リクエストには含めない）
   if (request.action === 'summarize') {
-    handleSummarize(request.sessionData, request.settings)
-      .then(summary => sendResponse({ success: true, summary }))
-      .catch(err   => sendResponse({ success: false, error: err.message }));
-    return true; // 非同期
+    GemLogSettings.get()
+      .then(settings => handleSummarize(request.sessionData, settings))
+      .then(summary  => sendResponse({ success: true, summary }))
+      .catch(err     => sendResponse({ success: false, error: err.message }));
+    return true;
   }
 });
 
@@ -117,7 +175,7 @@ ${messages}`;
   }
 
   const res = await fetch(apiUrl, { method: 'POST', headers, body });
-  if (!res.ok) throw new Error(`API Error ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`API Error ${res.status}`);
 
   const data = await res.json();
   switch (settings.apiProvider) {

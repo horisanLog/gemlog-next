@@ -6,8 +6,9 @@
   "default_locale": "en",
   "permissions": [
     "storage",
-    "unlimitedStorage",
-    "activeTab"
+    "activeTab",
+    "tabs",
+    "sidePanel"
   ],
   "host_permissions": [
     "https://gemini.google.com/*"
@@ -15,13 +16,16 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "action": {
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
+    },
+    "default_title": "GemLog Next"
   },
   "content_scripts": [
     {
